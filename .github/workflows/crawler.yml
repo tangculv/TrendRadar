@@ -168,3 +168,113 @@ jobs:
           S3_REGION: ${{ secrets.S3_REGION }}
           GITHUB_ACTIONS: true
         run: uv run python -m trendradar
+
+      - name: Push to Feishu Bitable
+        if: success()
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: |
+          python3 - <<'EOF'
+          import os, sqlite3, json, urllib.request, urllib.error, glob
+          from datetime import datetime
+
+          APP_ID     = os.environ.get("FEISHU_APP_ID", "")
+          APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
+          BASE_TOKEN = "DpSeb4AgtaDUh9sSwIMc3eKbnSz"
+          TABLE_ID   = "tblEWJIo2cvzWmEE"
+
+          if not APP_ID or not APP_SECRET:
+              print("FEISHU_APP_ID / FEISHU_APP_SECRET not set, skipping")
+              exit(0)
+
+          # 获取 tenant_access_token
+          def feishu_post(path, body, token=None):
+              url = "https://open.feishu.cn/open-apis" + path
+              data = json.dumps(body).encode()
+              req = urllib.request.Request(url, data=data,
+                    headers={"Content-Type": "application/json",
+                             **({"Authorization": f"Bearer {token}"} if token else {})})
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  return json.loads(r.read())
+
+          auth = feishu_post("/auth/v3/tenant_access_token/internal",
+                             {"app_id": APP_ID, "app_secret": APP_SECRET})
+          if auth.get("code") != 0:
+              print(f"Auth failed: {auth}")
+              exit(1)
+          tok = auth["tenant_access_token"]
+
+          # 找今天的 db 文件
+          today = datetime.now().strftime("%Y-%m-%d")
+          dbs = sorted(glob.glob(f"output/news/{today}.db") +
+                       glob.glob("output/news/*.db"), reverse=True)
+          if not dbs:
+              print("No DB found, skipping")
+              exit(0)
+          db_path = dbs[0]
+          print(f"Using DB: {db_path}")
+
+          conn = sqlite3.connect(db_path)
+          conn.row_factory = sqlite3.Row
+
+          # 查询 AI 筛选通过的 RSS 文章
+          rows = conn.execute("""
+              SELECT r.title, r.url, r.summary, r.feed_id, r.published_at
+              FROM rss_items r
+              JOIN ai_filter_analyzed_news a
+                ON a.news_item_id = r.id AND a.source_type = 'rss'
+              WHERE a.matched = 1
+              ORDER BY r.published_at DESC
+              LIMIT 20
+          """).fetchall()
+          conn.close()
+
+          if not rows:
+              print("No matched RSS items found")
+              exit(0)
+
+          print(f"Found {len(rows)} matched items")
+
+          # 拉已有标题防重复
+          list_url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/"
+                      f"{BASE_TOKEN}/tables/{TABLE_ID}/records?page_size=200")
+          req = urllib.request.Request(list_url,
+                headers={"Authorization": f"Bearer {tok}"})
+          with urllib.request.urlopen(req, timeout=15) as r:
+              existing_data = json.loads(r.read())
+          existing_titles = set(
+              rec["fields"].get("标题", "")
+              for rec in existing_data.get("data", {}).get("items", [])
+          )
+
+          created = 0
+          skipped = 0
+          for row in rows:
+              title = row["title"] or ""
+              if title in existing_titles:
+                  skipped += 1
+                  continue
+              summary = (row["summary"] or "").replace("<br>", " ")
+              # 去 HTML 标签
+              import re
+              summary = re.sub(r"<[^>]+>", "", summary).strip()[:100]
+
+              fields = {
+                  "标题": title,
+                  "摘要": summary,
+                  "决定": "待选",
+                  "状态": "队列中",
+              }
+              try:
+                  feishu_post(
+                      f"/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records",
+                      {"fields": fields}, token=tok)
+                  print(f"✅ {title[:40]}")
+                  created += 1
+                  existing_titles.add(title)
+              except Exception as e:
+                  print(f"❌ Failed to write {title[:30]}: {e}")
+
+          print(f"\nDone: +{created} new, {skipped} skipped")
+          EOF
